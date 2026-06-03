@@ -1,0 +1,17 @@
+{
+  "name": "wallies-arena-server",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@colyseus/ws-transport": "^0.15.0",
+    "colyseus": "^0.15.0",
+    "express": "^4.19.2"
+  }
+}
