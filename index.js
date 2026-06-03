@@ -121,5 +121,5 @@ app.get('/health', (_req, res) => res.json({ ok: true }));
 const server = http.createServer(app);
 const gameServer = new Server({ transport: new WebSocketTransport({ server }) });
 gameServer.define('arena', ArenaRoom);
-gameServer.listen(PORT);
+gameServer.listen(PORT, '0.0.0.0');
 console.log(`[arena] Colyseus listening on :${PORT}`);
