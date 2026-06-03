@@ -21,9 +21,9 @@
 
 import http from 'http';
 import express from 'express';
-import { Server } from 'colyseus';
+import pkg from 'colyseus';
+const { Server, Room } = pkg;
 import { WebSocketTransport } from '@colyseus/ws-transport';
-import { Room } from 'colyseus';
 import crypto from 'crypto';
 
 const PORT = Number(process.env.PORT || 2567);
