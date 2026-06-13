@@ -26,6 +26,7 @@ const { Server, Room } = pkg;
 import { WebSocketTransport } from '@colyseus/ws-transport';
 import crypto from 'crypto';
 import BlocklesRoom from './blocklesRoom.js';
+import BlocklesLobbyRoom from './blocklesLobbyRoom.js';
 
 const PORT = Number(process.env.PORT || 2567);
 const JOIN_SECRET = process.env.GAME_SERVER_JOIN_SECRET || '';
@@ -184,8 +185,9 @@ app.get('/health', (_req, res) => res.json({ ok: true }));
 
 const server = http.createServer(app);
 const gameServer = new Server({ transport: new WebSocketTransport({ server }) });
-gameServer.define('arena',    ArenaRoom);
-gameServer.define('blockles', BlocklesRoom);
+gameServer.define('arena',         ArenaRoom);
+gameServer.define('blockles',      BlocklesRoom);
+gameServer.define('blockles_lobby', BlocklesLobbyRoom);
 
 // Bind the shared server. This is the ONLY listen() call.
 server.listen(PORT, '0.0.0.0', () => {
