@@ -25,6 +25,7 @@ import pkg from 'colyseus';
 const { Server, Room } = pkg;
 import { WebSocketTransport } from '@colyseus/ws-transport';
 import crypto from 'crypto';
+import BlocklesRoom from './blocklesRoom.js';
 
 const PORT = Number(process.env.PORT || 2567);
 const JOIN_SECRET = process.env.GAME_SERVER_JOIN_SECRET || '';
@@ -62,7 +63,10 @@ function verifyTicket(token) {
   let payload;
   try { payload = JSON.parse(b64urlDecode(payloadB64)); } catch { return null; }
   if (!payload?.exp || payload.exp < Math.floor(Date.now() / 1000)) return null; // expired
-  return payload; // { sid, email, handle, team, mode, ... }
+  // payload = { sid, pid, handle, team, mode, ... }. NOTE: there is NO email in
+  // the token by design (see docs/IDENTITY_AND_PII_RULE.md). We seat/track by
+  // the opaque pid hash + public handle; the email lives only inside Base44.
+  return payload;
 }
 
 // ── Result writeback to Base44 ───────────────────────────────────────────────
@@ -129,9 +133,12 @@ class ArenaRoom extends Room {
   }
 
   onJoin(client) {
-    const { email, handle, team } = client.auth;
-    this.players.set(client.sessionId, { email, handle, team });
-    console.log(`[arena] ${handle || email} joined team ${team}`);
+    // NO email here — we only ever receive pid (opaque hash) + handle from the
+    // signed token. Seating/scoreboard use these; Base44 resolves the real
+    // email server-side at writeback time.
+    const { pid, handle, team } = client.auth;
+    this.players.set(client.sessionId, { pid, handle, team });
+    console.log(`[arena] ${handle || pid} joined team ${team}`);
   }
 
   // 30Hz authoritative simulation — replace with your real combat logic.
@@ -148,8 +155,11 @@ class ArenaRoom extends Room {
     if (elapsed > 90_000 || timedOut) {
       this.ended = true;
       const winner = timedOut ? 'draw' : (Math.random() < 0.5 ? 'one' : 'two');
+      // Scoreboard is keyed by HANDLE (public) — never email. Base44's
+      // submitGameServerResult applies ILY/MMR off the server-side roster, not
+      // off keys in result_stats, so handles here are purely descriptive.
       const stats = {};
-      for (const p of this.players.values()) stats[p.email] = { team: p.team };
+      for (const p of this.players.values()) stats[p.handle || p.pid] = { team: p.team };
       // Fire-and-forget the (idempotent, retrying) writeback, then dispose.
       writeResult(this.base44SessionId, winner, stats).finally(() => this.disconnect());
     }
@@ -174,7 +184,8 @@ app.get('/health', (_req, res) => res.json({ ok: true }));
 
 const server = http.createServer(app);
 const gameServer = new Server({ transport: new WebSocketTransport({ server }) });
-gameServer.define('arena', ArenaRoom);
+gameServer.define('arena',    ArenaRoom);
+gameServer.define('blockles', BlocklesRoom);
 
 // Bind the shared server. This is the ONLY listen() call.
 server.listen(PORT, '0.0.0.0', () => {
