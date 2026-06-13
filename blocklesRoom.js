@@ -4,36 +4,59 @@
 //    Stored as .txt so the frontend linter ignores it. When deploying, save it
 //    as `blocklesRoom.js` in your server repo and register it (see DEPLOY below).
 //
+// ⚠️ CANONICAL COPY. Byte-for-byte identical to
+//    docs/blockles/colyseus-server/blocklesRoom.js.txt — deploy EITHER one.
+//    The client hook components/blockles/useBlocklesRealtime.js speaks exactly
+//    this protocol.
+//
+// === DEPLOY (add to the EXISTING Arena server's index.js) ===
+//   import BlocklesRoom from './blocklesRoom.js';   // default import (no braces)
+//   gameServer.define('arena',    ArenaRoom);
+//   gameServer.define('blockles', BlocklesRoom);
+// Clients connect to `wss://<railway-domain>/blockles` with { token }.
+// Reuses the SAME GAME_SERVER_JOIN_SECRET — verifyTicket is identical to Arena.
+//
+// === WIRE PROTOCOL (client ⇄ this room) ===
+//   Inbound  (client → room):
+//     send('pos',  { x, y, z, ry })                         — throttled ~12Hz
+//     send('edit', { action:'place'|'remove', x, y, z, block_type })
+//   Outbound (room → client):
+//     on('joined',  { self_id })                            — your own roster id
+//     on('players', { players:[{id,handle,avatar_url,avatar_style,x,y,z,ry}] })
+//     on('edit',    { id, action, x, y, z, block_type })
+//
 // === WHAT THIS ROOM IS ===
 // A lightweight, NON-authoritative realtime relay for a single Blockles world.
-// Unlike ArenaRoom (which runs an authoritative 30Hz combat sim and writes
-// results/MMR/ILY back to Base44), this room has NO game logic, NO winner, and
-// NO writeback. Block persistence + anti-cheat already live in Base44
-// (placeBlocklesBlock / removeBlocklesBlock). This room only BROADCASTS:
-//   - each player's live position to everyone else in the world,
-//   - each block place/break event to everyone else, instantly.
+// Unlike ArenaRoom (authoritative 30Hz combat sim with MMR/ILY writeback), this
+// room has NO game logic, NO winner, NO writeback. Block persistence + anti-
+// cheat live in Base44 (placeBlocklesBlock / removeBlocklesBlock). This room
+// only BROADCASTS each player's position and each block place/break, instantly.
+//
+// === ANTI-EXPLOIT ===
+// Non-authoritative: a malicious client can at MOST make OTHER players briefly
+// SEE a ghost block/position — it can never grant blocks, ILY, or alter
+// persisted state (only Base44 writes the DB, with auth + double-spend guards).
+// To stop a flood degrading the room we rate-limit BOTH inbound channels per
+// socket (token-bucket) and clamp edit coords to world bounds. Over-budget
+// messages are silently dropped.
 //
 // === IDENTITY / PII ===
 // Players are seated by the OPAQUE pid hash + public handle carried in the
 // signed token (mode === 'blockles'). No email ever reaches this server.
-//
-// === DEPLOY (add to the EXISTING Arena server's index.js) ===
-//   import BlocklesRoom from './blocklesRoom.js';
-//   ...
-//   gameServer.define('blockles', BlocklesRoom);
-// Clients connect to `wss://<railway-domain>/blockles` with { token }.
-// Reuses the SAME GAME_SERVER_JOIN_SECRET — verifyTicket is identical to Arena.
 
 import pkg from 'colyseus';
 const { Room } = pkg;
 import crypto from 'crypto';
 
 const JOIN_SECRET = process.env.GAME_SERVER_JOIN_SECRET || '';
-const BROADCAST_HZ = 12;              // how often we fan out the player roster
-const IDLE_KICK_MS = 30000;           // drop a socket that hasn't sent anything
-const MAX_PLAYERS_PER_WORLD = 32;     // safety ceiling per world room
+const BROADCAST_HZ = 12;            // roster fan-out rate (matches client throttle)
+const IDLE_KICK_MS = 30000;         // drop a socket silent for 30s (closed tab)
+const MAX_PLAYERS = 16;             // matches Base44 upsertBlocklesPresence cap
+const WORLD_MIN = -64, WORLD_MAX = 64, WORLD_MAX_HEIGHT = 64;
+const POS_BUCKET_MAX = 20, POS_REFILL_PER_SEC = 15;
+const EDIT_BUCKET_MAX = 30, EDIT_REFILL_PER_SEC = 12;
 
-// ── Ticket verification (identical HMAC to Arena's verifyTicket) ─────────────
+// ── Ticket verification (identical HMAC to issueBlocklesRealtimeToken) ─────────
 function b64urlDecode(s) {
   s = s.replace(/-/g, '+').replace(/_/g, '/');
   while (s.length % 4) s += '=';
@@ -57,26 +80,61 @@ function verifyTicket(token) {
   return payload; // { sid(=worldId), room(=worldId), pid, handle, mode }
 }
 
+function num(n, d = 0) { const v = Number(n); return Number.isFinite(v) ? v : d; }
+function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+function takeToken(bucket, max, refillPerSec) {
+  const now = Date.now();
+  const elapsed = (now - bucket.ts) / 1000;
+  bucket.ts = now;
+  bucket.tokens = Math.min(max, bucket.tokens + elapsed * refillPerSec);
+  if (bucket.tokens < 1) return false;
+  bucket.tokens -= 1;
+  return true;
+}
+
 export default class BlocklesRoom extends Room {
-  onCreate() {
-    this.maxClients = MAX_PLAYERS_PER_WORLD;
-    // socketSessionId -> { pid, handle, avatar_url, avatar_style, x,y,z, ry, lastSeen }
+  onCreate(options) {
+    this.maxClients = MAX_PLAYERS;
+    this.worldId = (options && options.world_id) ? String(options.world_id) : null;
     this.players = new Map();
     this.broadcastHandle = this.clock.setInterval(() => this.broadcastRoster(), 1000 / BROADCAST_HZ);
     this.reaperHandle = this.clock.setInterval(() => this.reapIdle(), 5000);
+
+    this.onMessage('pos', (client, msg) => {
+      const p = this.players.get(client.sessionId);
+      if (!p || !msg) return;
+      p.lastSeen = Date.now();
+      if (!takeToken(p.posBucket, POS_BUCKET_MAX, POS_REFILL_PER_SEC)) return;
+      p.x = num(msg.x); p.y = num(msg.y); p.z = num(msg.z); p.ry = num(msg.ry);
+    });
+
+    this.onMessage('edit', (client, msg) => {
+      const p = this.players.get(client.sessionId);
+      if (!p || !msg) return;
+      p.lastSeen = Date.now();
+      if (!takeToken(p.editBucket, EDIT_BUCKET_MAX, EDIT_REFILL_PER_SEC)) return;
+      const x = clamp(Math.round(num(msg.x)), WORLD_MIN, WORLD_MAX);
+      const y = clamp(Math.round(num(msg.y)), 0, WORLD_MAX_HEIGHT);
+      const z = clamp(Math.round(num(msg.z)), WORLD_MIN, WORLD_MAX);
+      const action = msg.action === 'remove' ? 'remove' : 'place';
+      this.broadcast('edit', {
+        id: client.sessionId,
+        action, x, y, z,
+        block_type: action === 'place' ? String(msg.block_type || '').slice(0, 32) : null,
+      }, { except: client });
+    });
   }
 
-  // Validate the Base44 ticket BEFORE the socket may join, and bind this room to
-  // its world id (anti-replay: every joiner must carry a ticket for the SAME world).
   onAuth(client, options) {
-    const payload = verifyTicket(options?.token);
+    const payload = verifyTicket(options && options.token);
     if (!payload) throw new Error('invalid_or_expired_ticket');
     if (!this.worldId) {
       this.worldId = payload.sid;
     } else if (payload.sid !== this.worldId) {
       throw new Error('ticket_world_mismatch');
     }
-    return payload; // becomes client.auth
+    return payload;
   }
 
   onJoin(client, options) {
@@ -84,43 +142,16 @@ export default class BlocklesRoom extends Room {
     this.players.set(client.sessionId, {
       pid,
       handle: handle || 'Builder',
-      avatar_url: (options?.avatar_url || '').toString() || null,
-      avatar_style: (options?.avatar_style || '').toString() || null,
+      avatar_url: (options?.avatar_url || '').toString().slice(0, 512) || null,
+      avatar_style: (options?.avatar_style || '').toString().slice(0, 64) || null,
       x: 0, y: 0, z: 0, ry: 0,
       lastSeen: Date.now(),
+      posBucket: { tokens: POS_BUCKET_MAX, ts: Date.now() },
+      editBucket: { tokens: EDIT_BUCKET_MAX, ts: Date.now() },
     });
-    // Tell the client it's in, and which roster id is "self" so it can exclude itself.
     client.send('joined', { self_id: client.sessionId });
   }
 
-  onMessage(client, type, message) {
-    const p = this.players.get(client.sessionId);
-    if (!p) return;
-    p.lastSeen = Date.now();
-
-    if (type === 'pos' && message) {
-      p.x = Number(message.x) || 0;
-      p.y = Number(message.y) || 0;
-      p.z = Number(message.z) || 0;
-      p.ry = Number(message.ry) || 0;
-      return;
-    }
-    if (type === 'edit' && message) {
-      // Relay the edit to everyone else. We do NOT persist here — Base44 already
-      // did (or will) authoritatively; this is purely the instant visual echo.
-      const action = message.action === 'remove' ? 'remove' : 'place';
-      this.broadcast('edit', {
-        id: client.sessionId,
-        action,
-        x: Number(message.x) || 0,
-        y: Number(message.y) || 0,
-        z: Number(message.z) || 0,
-        block_type: message.block_type || null,
-      }, { except: client });
-    }
-  }
-
-  // Fan out the live player roster (positions) to everyone.
   broadcastRoster() {
     if (this.players.size === 0) return;
     const players = [];
@@ -136,7 +167,6 @@ export default class BlocklesRoom extends Room {
     this.broadcast('players', { players });
   }
 
-  // Drop sockets that have gone silent (closed tab without a clean leave).
   reapIdle() {
     const now = Date.now();
     for (const [id, p] of this.players.entries()) {
