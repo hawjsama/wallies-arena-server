@@ -71,7 +71,7 @@ function verifyTicket(token) {
   let payload;
   try { payload = JSON.parse(b64urlDecode(payloadB64)); } catch { return null; }
   if (!payload?.exp || payload.exp < Math.floor(Date.now() / 1000)) return null;
-  if (payload.mode !== 'blockles_lobby') return null; // only lobby tickets here
+  if (payload.room !== 'blockles_lobby') return null; // only lobby tickets here
   return payload; // { sid:'blockles_lobby', pid, handle, mode }
 }
 
@@ -104,6 +104,10 @@ export default class BlocklesLobbyRoom extends Room {
     this.onMessage('queue', (client, msg) => {
       const mode = msg && VALID_MODES.includes(msg.mode) ? msg.mode : null;
       if (!mode) return;
+      // Defense-in-depth: the queue message mode MUST match the token's mode
+      // (the durable ticket). Prevents a player from accidentally queuing for
+      // a different mode than their ticket, which would strand them forever.
+      if (mode !== client.auth.mode) return;
       const { pid, handle } = client.auth;
       this.queued.set(client.sessionId, { pid, handle, mode, queuedAt: Date.now() });
       const position = [...this.queued.values()].filter((q) => q.mode === mode).length;
